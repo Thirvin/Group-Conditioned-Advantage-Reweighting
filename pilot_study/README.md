@@ -1,6 +1,6 @@
 我正在進行一項 LLM 強化學習的研究。目前我們先把實驗目標從數學題改成程式問題，想觀察模型在解 code / debugging / algorithm 類題目時，是否更容易形成可分群的策略模式。
 
-目前這個 repo 已經有一條可跑的 rollout generation + clustering + evaluation pipeline；不過先前很多設定仍是為數學題實驗留下來的。接下來 README 的目標敘述以「程式問題」為主，數學題只視為舊實驗背景。
+目前這個 repo 已經有一條可跑的 rollout generation + clustering + evaluation pipeline，現在預設已切到「程式問題」實驗；數學題只視為舊實驗背景。
 
 ## 使用 uv 管理環境
 
@@ -83,6 +83,66 @@ API 版生成腳本現在也支援 checkpoint / resume：
 uv lock
 ```
 
+## `code_evals`：程式題資料與 reward evaluator
+
+repo 內目前已放了一套偏競程風格的 code evaluation 原型，位於 `code_evals/`，可作為把 reward 從數學題改成「程式題測資通過率」的起點。
+
+### 內容概覽
+
+- `code_evals/LCB_dataset.csv`
+  - 目前的程式題 prompt 資料。
+  - 欄位至少包含：
+    - `no`：題目 ID，例如 `atcoder/abc370_a`
+    - `text`：完整題述
+- `code_evals/judge.py`
+  - Python 入口函式 `judge(displayed_id, code_str)`。
+  - 會把模型生成的 C++ 程式碼寫成暫存檔，呼叫 shell judger，最後回傳整數狀態碼。
+- `code_evals/judger.sh`
+  - 實際執行編譯與測資比對。
+  - 目前使用 `g++ -O2 -std=gnu++2a` 編譯，代表 evaluator 目前是以 C++ 解答為前提。
+
+### reward 定義
+
+`judge.py` / `judger.sh` 目前提供的是非常直接的 binary reward：
+
+- `1`：compile 成功，且全部 testcase 輸出都正確
+- `0`：compile 成功，但至少一筆 testcase 答錯
+- `-1`：compile 失敗，或 testcase 檔案不完整 / judging 過程異常
+
+`judger.sh` 也對每次執行加了基本限制：
+
+- CPU time limit：`ulimit -t 2`
+- virtual memory limit：`ulimit -v 1048576`
+
+### 目前 judge 的工作方式
+
+給定題目 ID 與模型輸出的 C++ 程式碼後：
+
+1. `judge.py` 會先移除 markdown code fence，例如 ````cpp` 與 ```。
+   若回覆裡有多個 fenced code block，會抓最後一個 ````cpp ... ```` 片段當作最終答案。
+2. 它會把程式碼寫到對應 testcase 目錄下的暫存檔 `temp_<uuid>.cpp`。
+3. `judger.sh` 會在該題 testcase 目錄中編譯程式。
+4. 編譯成功後，會逐一讀取 `*.in` / `*.out` 測資做比對。
+5. 全部通過回傳 `1`；有任何 testcase 不符回傳 `0`；編譯失敗回傳 `-1`。
+
+### 目前整合狀態與限制
+
+這套 `code_evals` 原型現在已接到 `01_generate_rollouts.py` 與 `01_generate_rollouts_api.py`。主流程腳本目前預設會：
+
+- 讀取 `code_evals/LCB_dataset.csv` 當作 prompt source
+- 要求模型把最終 C++ 解答放在最後一個 ```cpp ... ``` code block
+- 用 `code_evals.judge.judge(...)` 對該 code block 做 testcase-based reward 計算
+
+目前 rollout generation 端已經切到程式題；若之後還要往前走，下一步會是：
+
+- 擴充到不只 C++ 的 evaluator
+- 把 testcase root 與資料路徑進一步做成更可攜的設定
+- 視需要把 compile error / wrong answer / runtime error 拆成更細的 reward signal
+
+目前還有一個實作層面的限制要注意：
+
+- testcase root 預設仍是 `/data/leesin5202/version_1/LCB_eval/testcases`，但現在可用 `CODE_EVAL_TESTCASE_ROOT` 或 rollout 腳本的 `--testcase-root` 覆寫
+
 ## 目前實驗目標
 
 1. 蒐集一批「程式問題」prompt 的多條 rollout。
@@ -136,6 +196,7 @@ uv lock
 
 - 題目型態：bug fixing、程式理解、演算法設計、code completion、unit-test repair
 - reward：通過測試、compile success、execution success、hidden test pass rate、AST-level correctness
+- 若沿用目前 `code_evals` 原型，最直接的第一步就是先用 C++ testcase pass/fail 當 binary reward
 - prefix：優先觀察 reasoning / strategy，而不是最終答案文字
 
 目前 repo 的技術骨架已可重用；真正需要替換的是：

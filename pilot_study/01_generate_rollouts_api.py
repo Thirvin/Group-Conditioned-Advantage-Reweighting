@@ -11,30 +11,33 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from datasets import load_dataset
 from openai import APIError, APIConnectionError, APITimeoutError, OpenAI, RateLimitError
+import pandas as pd
 from tqdm.auto import tqdm
+
+from code_evals import DEFAULT_TESTCASE_ROOT, judge
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "Solve the following math word problem. Show your reasoning, then give the final "
-    "answer in the format '#### <answer>'."
+    "You are solving a competitive programming problem. Think through the algorithm, "
+    "edge cases, and complexity, then output a complete C++ solution that can be "
+    "compiled with g++ -O2 -std=gnu++2a. Put the final answer inside a ```cpp ... ``` "
+    "block, and make the last fenced block in the response be the final code."
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate rollouts through the OpenRouter API.")
+    parser = argparse.ArgumentParser(description="Generate programming-task rollouts through the OpenRouter API.")
     parser.add_argument("--model-name", default="google/gemma-3-27b-it")
     parser.add_argument("--api-key", default=os.environ.get("OPENROUTER_API_KEY"))
     parser.add_argument("--base-url", default=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
     parser.add_argument("--http-referer", default=os.environ.get("OPENROUTER_HTTP_REFERER"))
     parser.add_argument("--x-title", default=os.environ.get("OPENROUTER_X_TITLE", "pilot-study"))
     parser.add_argument("--output-path", default="rollouts_data.pkl")
-    parser.add_argument("--dataset-name", default="MathArena/aime_2026")
-    parser.add_argument("--dataset-config", default=None)
-    parser.add_argument("--dataset-split", default="train")
-    parser.add_argument("--question-column", default="problem")
-    parser.add_argument("--answer-column", default="answer")
+    parser.add_argument("--dataset-path", default="code_evals/LCB_dataset.csv")
+    parser.add_argument("--question-column", default="text")
+    parser.add_argument("--id-column", default="no")
+    parser.add_argument("--testcase-root", default=str(DEFAULT_TESTCASE_ROOT))
     parser.add_argument("--num-prompts", type=int, default=30)
     parser.add_argument("--num-trajectories", type=int, default=64)
     parser.add_argument("--max-output-tokens", type=int, default=256)
@@ -72,56 +75,9 @@ def apply_smoke_test_overrides(args: argparse.Namespace) -> None:
     args.prefix_token_index = min(args.prefix_token_index, 16)
 
 
-def normalize_numeric_string(text: str) -> Optional[str]:
-    if text is None:
-        return None
-    value = text.strip().replace(",", "")
-    value = re.sub(r"^\$+", "", value)
-    value = value.rstrip(".")
-    if not value:
-        return None
-    if value.startswith("."):
-        value = f"0{value}"
-    if value.startswith("-."):
-        value = value.replace("-.", "-0.", 1)
-    if re.fullmatch(r"-?\d+(?:\.\d+)?", value) is None:
-        return None
-    if "." not in value:
-        sign = ""
-        digits = value
-        if digits.startswith("-"):
-            sign = "-"
-            digits = digits[1:]
-        digits = digits.lstrip("0") or "0"
-        return f"{sign}{digits}"
-    value = value.rstrip("0").rstrip(".")
-    return value
-
-
-def extract_reference_answer(answer_text: str) -> Optional[str]:
-    match = re.search(r"####\s*([-+]?\$?[\d,]+(?:\.\d+)?)", answer_text)
-    if match:
-        return normalize_numeric_string(match.group(1))
-    matches = re.findall(r"[-+]?\$?[\d,]+(?:\.\d+)?", answer_text)
-    if matches:
-        return normalize_numeric_string(matches[-1])
-    return None
-
-
-def extract_predicted_answer(generated_text: str) -> Optional[str]:
-    match = re.search(r"####\s*([-+]?\$?[\d,]+(?:\.\d+)?)", generated_text)
-    if match:
-        return normalize_numeric_string(match.group(1))
-    matches = re.findall(r"[-+]?\$?[\d,]+(?:\.\d+)?", generated_text)
-    if matches:
-        return normalize_numeric_string(matches[-1])
-    return None
-
-
-def compute_reward(generated_text: str, answer_text: str) -> int:
-    gold = extract_reference_answer(answer_text)
-    pred = extract_predicted_answer(generated_text)
-    return int(gold is not None and pred is not None and gold == pred)
+def compute_reward(generated_text: str, problem_id: str, testcase_root: str) -> int:
+    status = judge(problem_id, generated_text, testcase_root=testcase_root)
+    return int(status == 1)
 
 
 def build_messages(question: str) -> List[Dict[str, str]]:
@@ -129,6 +85,20 @@ def build_messages(question: str) -> List[Dict[str, str]]:
         {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
+
+
+def load_programming_dataset(args: argparse.Namespace) -> List[Dict]:
+    dataset_path = Path(args.dataset_path)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset CSV not found: {dataset_path}")
+
+    dataset = pd.read_csv(dataset_path)
+    required_columns = {args.id_column, args.question_column}
+    missing_columns = sorted(required_columns - set(dataset.columns))
+    if missing_columns:
+        raise ValueError(f"Dataset is missing required columns: {missing_columns}")
+
+    return dataset.to_dict(orient="records")
 
 
 def extract_retry_delay_seconds(error: Exception) -> Optional[float]:
@@ -286,7 +256,7 @@ def generate_trajectories_for_prompt(
             "reasoning_text": reasoning_text,
             "prefix_text": make_prefix_text(reasoning_text, args.prefix_token_index),
             "prefix_hidden_state": None,
-            "reward": compute_reward(full_text, prompt_item["answer_text"]),
+            "reward": compute_reward(full_text, prompt_item["problem_id"], args.testcase_root),
         }
 
     with ThreadPoolExecutor(max_workers=args.parallel_requests) as executor:
@@ -332,7 +302,7 @@ def main() -> None:
         probe = call_openrouter(
             client=client,
             args=args,
-            prompt_text="Compute 12 * 13. Show your reasoning, then answer with #### <answer>.",
+            prompt_text="Write a C++ program that reads two integers and prints their sum.",
             seed=args.seed,
         )
         print("HAS_REASONING=", bool(probe["reasoning"].strip()))
@@ -340,7 +310,7 @@ def main() -> None:
         print("CONTENT_PREVIEW=", probe["content"][:500])
         return
 
-    dataset = load_dataset(args.dataset_name, args.dataset_config, split=args.dataset_split)
+    dataset = load_programming_dataset(args)
     sample_size = min(args.num_prompts, len(dataset))
     chosen_indices = random.sample(range(len(dataset)), sample_size)
 
@@ -354,14 +324,15 @@ def main() -> None:
     ):
         sample = dataset[dataset_idx]
         prompt_text = str(sample[args.question_column])
-        answer_text = str(sample[args.answer_column])
+        problem_id = str(sample[args.id_column])
         existing_prompt_result = existing_index.get(int(dataset_idx))
         if existing_prompt_result is None:
             existing_prompt_result = {
                 "prompt_id": prompt_order,
                 "prompt_text": prompt_text,
                 "dataset_idx": int(dataset_idx),
-                "gold_answer": extract_reference_answer(answer_text),
+                "problem_id": problem_id,
+                "gold_answer": None,
                 "hidden_state_source": "unavailable_from_openrouter_chat_completions_api",
                 "trajectories": [],
             }
@@ -369,7 +340,8 @@ def main() -> None:
         else:
             existing_prompt_result["prompt_id"] = prompt_order
             existing_prompt_result["prompt_text"] = prompt_text
-            existing_prompt_result["gold_answer"] = extract_reference_answer(answer_text)
+            existing_prompt_result["problem_id"] = problem_id
+            existing_prompt_result["gold_answer"] = None
 
         def save_partial_results() -> None:
             ordered_results = []
@@ -386,7 +358,7 @@ def main() -> None:
             prompt_item={
                 "prompt_id": prompt_order,
                 "prompt_text": prompt_text,
-                "answer_text": answer_text,
+                "problem_id": problem_id,
             },
             existing_prompt_result=existing_prompt_result,
             save_callback=save_partial_results,

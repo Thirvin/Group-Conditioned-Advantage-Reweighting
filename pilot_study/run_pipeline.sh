@@ -28,8 +28,8 @@ run_local() {
 }
 
 run_api() {
-  if [[ -z "${GEMINI_API_KEY:-}" ]]; then
-    echo "GEMINI_API_KEY is not set." >&2
+  if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "OPENROUTER_API_KEY is not set." >&2
     exit 1
   fi
 

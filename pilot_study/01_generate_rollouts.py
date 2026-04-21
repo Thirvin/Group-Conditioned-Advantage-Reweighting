@@ -3,32 +3,35 @@ import argparse
 import gc
 import pickle
 import random
-import re
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
-from datasets import load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 
+from code_evals import DEFAULT_TESTCASE_ROOT, judge
+
 
 DEFAULT_SYSTEM_PROMPT = (
-    "Solve the following math word problem. Show your reasoning, then give the final "
-    "answer in the format '#### <answer>'."
+    "You are solving a competitive programming problem. Think through the approach "
+    "carefully, then output a complete C++ solution that can be compiled with "
+    "g++ -O2 -std=gnu++2a. Put the final answer inside a ```cpp ... ``` block, "
+    "and make the last fenced block in the response be the final code."
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate offline rollouts with vLLM and extract hidden states.")
+    parser = argparse.ArgumentParser(description="Generate programming-task rollouts with vLLM and extract hidden states.")
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--output-path", default="rollouts_data.pkl")
-    parser.add_argument("--dataset-name", default="MathArena/aime_2026")
-    parser.add_argument("--dataset-config", default=None)
-    parser.add_argument("--dataset-split", default="train")
-    parser.add_argument("--question-column", default="problem")
-    parser.add_argument("--answer-column", default="answer")
+    parser.add_argument("--dataset-path", default="code_evals/LCB_dataset.csv")
+    parser.add_argument("--question-column", default="text")
+    parser.add_argument("--id-column", default="no")
+    parser.add_argument("--testcase-root", default=str(DEFAULT_TESTCASE_ROOT))
     parser.add_argument("--num-prompts", type=int, default=30)
     parser.add_argument("--num-trajectories", type=int, default=64)
     parser.add_argument("--hidden-batch-size", type=int, default=8)
@@ -78,79 +81,44 @@ def build_prompt(question: str, tokenizer: AutoTokenizer) -> str:
     ]
     if hasattr(tokenizer, "apply_chat_template"):
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return f"{DEFAULT_SYSTEM_PROMPT}\n\nQuestion: {question}\nAnswer:"
+    return (
+        f"{DEFAULT_SYSTEM_PROMPT}\n\nProblem:\n{question}\n\n"
+        "Write the full C++ solution and wrap it in a final ```cpp``` block."
+    )
 
 
-def normalize_numeric_string(text: str) -> Optional[str]:
-    if text is None:
-        return None
-    value = text.strip().replace(",", "")
-    value = re.sub(r"^\$+", "", value)
-    value = value.rstrip(".")
-    if not value:
-        return None
-    if value.startswith("."):
-        value = f"0{value}"
-    if value.startswith("-."):
-        value = value.replace("-.", "-0.", 1)
-    if re.fullmatch(r"-?\d+(?:\.\d+)?", value) is None:
-        return None
-    if "." not in value:
-        sign = ""
-        digits = value
-        if digits.startswith("-"):
-            sign = "-"
-            digits = digits[1:]
-        digits = digits.lstrip("0") or "0"
-        return f"{sign}{digits}"
-    if "." in value:
-        value = value.rstrip("0").rstrip(".")
-    return value
-
-
-def extract_reference_answer(answer_text: str) -> Optional[str]:
-    match = re.search(r"####\s*([-+]?\$?[\d,]+(?:\.\d+)?)", answer_text)
-    if match:
-        return normalize_numeric_string(match.group(1))
-    matches = re.findall(r"[-+]?\$?[\d,]+(?:\.\d+)?", answer_text)
-    if matches:
-        return normalize_numeric_string(matches[-1])
-    return None
-
-
-def extract_predicted_answer(generated_text: str) -> Optional[str]:
-    match = re.search(r"####\s*([-+]?\$?[\d,]+(?:\.\d+)?)", generated_text)
-    if match:
-        return normalize_numeric_string(match.group(1))
-    matches = re.findall(r"[-+]?\$?[\d,]+(?:\.\d+)?", generated_text)
-    if matches:
-        return normalize_numeric_string(matches[-1])
-    return None
-
-
-def compute_reward(generated_text: str, answer_text: str) -> int:
-    gold = extract_reference_answer(answer_text)
-    pred = extract_predicted_answer(generated_text)
-    return int(gold is not None and pred is not None and gold == pred)
+def compute_reward(generated_text: str, problem_id: str, testcase_root: str) -> int:
+    status = judge(problem_id, generated_text, testcase_root=testcase_root)
+    return int(status == 1)
 
 
 def load_prompts(args: argparse.Namespace, tokenizer: AutoTokenizer) -> List[Dict]:
-    dataset = load_dataset(args.dataset_name, args.dataset_config, split=args.dataset_split)
-    sample_size = min(args.num_prompts, len(dataset))
-    chosen_indices = random.sample(range(len(dataset)), sample_size)
+    dataset_path = Path(args.dataset_path)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset CSV not found: {dataset_path}")
+
+    dataset = pd.read_csv(dataset_path)
+    required_columns = {args.id_column, args.question_column}
+    missing_columns = sorted(required_columns - set(dataset.columns))
+    if missing_columns:
+        raise ValueError(f"Dataset is missing required columns: {missing_columns}")
+
+    records = dataset.to_dict(orient="records")
+    sample_size = min(args.num_prompts, len(records))
+    chosen_indices = random.sample(range(len(records)), sample_size)
     prompts: List[Dict] = []
     for prompt_order, dataset_idx in enumerate(chosen_indices):
-        sample = dataset[dataset_idx]
+        sample = records[dataset_idx]
         prompt_text = str(sample[args.question_column])
-        answer_text = str(sample[args.answer_column])
+        problem_id = str(sample[args.id_column])
         prompts.append(
             {
                 "prompt_id": prompt_order,
                 "dataset_idx": int(dataset_idx),
+                "problem_id": problem_id,
                 "prompt_text": prompt_text,
                 "prompt_rendered": build_prompt(prompt_text, tokenizer),
-                "gold_answer": extract_reference_answer(answer_text),
-                "answer_text": answer_text,
+                "gold_answer": None,
             }
         )
     return prompts
@@ -199,7 +167,7 @@ def generate_rollouts_with_vllm(
                     "traj_id": traj_id,
                     "full_text": completion.text,
                     "generated_token_ids": token_ids,
-                    "reward": compute_reward(completion.text, prompt_item["answer_text"]),
+                    "reward": compute_reward(completion.text, prompt_item["problem_id"], args.testcase_root),
                 }
             )
 
@@ -207,10 +175,10 @@ def generate_rollouts_with_vllm(
             {
                 "prompt_id": prompt_item["prompt_id"],
                 "dataset_idx": prompt_item["dataset_idx"],
+                "problem_id": prompt_item["problem_id"],
                 "prompt_text": prompt_item["prompt_text"],
                 "prompt_rendered": prompt_item["prompt_rendered"],
                 "gold_answer": prompt_item["gold_answer"],
-                "answer_text": prompt_item["answer_text"],
                 "trajectories": trajectories,
             }
         )
@@ -316,6 +284,7 @@ def extract_hidden_states_with_transformers(
                 "prompt_id": prompt_item["prompt_id"],
                 "prompt_text": prompt_item["prompt_text"],
                 "dataset_idx": prompt_item["dataset_idx"],
+                "problem_id": prompt_item.get("problem_id"),
                 "gold_answer": prompt_item["gold_answer"],
                 "trajectories": finalized_trajectories,
             }
