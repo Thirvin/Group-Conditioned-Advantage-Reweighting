@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import pickle
-import re
-import unicodedata
 from collections import defaultdict
 from typing import Dict, List
 
 import numpy as np
+
+from code_evals import extract_last_cpp_block
 
 
 METHOD_TO_KEY = {
@@ -16,46 +16,6 @@ METHOD_TO_KEY = {
     "random": "cluster_id_random",
 }
 
-STRATEGY_MARKERS = {
-    "assume": "<ASSUME>",
-    "suppose": "<ASSUME>",
-    "let": "<LET>",
-    "check": "<CHECK>",
-    "verify": "<CHECK>",
-}
-
-ORDER_MARKERS = {
-    "first": "<STEP_FIRST>",
-    "second": "<STEP_SECOND>",
-    "third": "<STEP_THIRD>",
-    "next": "<STEP_NEXT>",
-    "then": "<STEP_NEXT>",
-    "finally": "<STEP_FINAL>",
-    "therefore": "<THEREFORE>",
-    "hence": "<THEREFORE>",
-    "thus": "<THEREFORE>",
-    "because": "<BECAUSE>",
-    "since": "<BECAUSE>",
-}
-
-UNIT_WORDS = {
-    "cm", "mm", "m", "km", "inch", "inches", "ft", "feet", "yard", "yards",
-    "meter", "meters", "kilometer", "kilometers", "mile", "miles",
-    "sec", "second", "seconds", "min", "minute", "minutes", "hour", "hours",
-    "day", "days", "week", "weeks", "month", "months", "year", "years",
-    "kg", "g", "mg", "lb", "lbs", "gram", "grams", "dollar", "dollars",
-    "cent", "cents", "degree", "degrees", "percent", "percentage",
-}
-
-COMMON_MATH_WORDS = {
-    "if", "else", "for", "all", "any", "and", "or", "not", "the", "a", "an",
-    "sum", "product", "value", "equation", "expression", "number", "numbers",
-    "integer", "integers", "fraction", "fractions", "ratio", "area", "length",
-    "width", "height", "volume", "triangle", "square", "circle", "solve",
-    "find", "prove", "show", "using", "case", "cases", "total", "count",
-}
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Show clustering results for one prompt.")
     parser.add_argument("--input-path", default="clustered_data.pkl")
@@ -63,8 +23,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=sorted(METHOD_TO_KEY.keys()), default="embedding")
     parser.add_argument("--max-text-chars", type=int, default=240)
     parser.add_argument("--max-items-per-cluster", type=int, default=10)
+    parser.add_argument("--show-code", action="store_true")
+    parser.add_argument("--max-code-lines", type=int, default=40)
     parser.add_argument("--sort-by", choices=["cluster", "reward"], default="cluster")
-    parser.add_argument("--show-normalized-reasoning", action="store_true")
     parser.add_argument("--min-accuracy", type=float, default=0.2)
     parser.add_argument("--max-accuracy", type=float, default=0.8)
     parser.add_argument(
@@ -87,52 +48,12 @@ def shorten(text: str, max_chars: int) -> str:
     return text[: max_chars - 3] + "..."
 
 
-def normalize_reasoning_text(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text or "")
-    text = text.lower()
-    text = text.replace("×", "*").replace("÷", "/").replace("−", "-").replace("–", "-").replace("—", "-")
-    text = text.replace("≤", " <= ").replace("≥", " >= ").replace("≠", " != ").replace("≈", " ~= ")
-    text = text.replace("⇒", " => ").replace("→", " -> ").replace("∴", " therefore ")
-
-    for source, marker in STRATEGY_MARKERS.items():
-        text = re.sub(rf"\b{source}\b", f" {marker} ", text)
-    for source, marker in ORDER_MARKERS.items():
-        text = re.sub(rf"\b{source}\b", f" {marker} ", text)
-
-    filler_patterns = [
-        r"\bwe have\b",
-        r"\bnote that\b",
-        r"\bobserve that\b",
-        r"\bit follows that\b",
-        r"\bso we get\b",
-        r"\bnow\b",
-        r"\bclearly\b",
-        r"\bsimply\b",
-    ]
-    for pattern in filler_patterns:
-        text = re.sub(pattern, " ", text)
-
-    variable_map = {}
-
-    def register_variable(match: re.Match) -> str:
-        marker = match.group(1)
-        var_name = match.group(2)
-        if var_name not in variable_map:
-            variable_map[var_name] = f"var_{len(variable_map) + 1}"
-        return f"{marker} {variable_map[var_name]}"
-
-    text = re.sub(r"(<ASSUME>|<LET>)\s+([a-zA-Z][a-zA-Z0-9_]*)", register_variable, text)
-
-    if variable_map:
-        protected_words = set(UNIT_WORDS) | set(COMMON_MATH_WORDS)
-        for original, canonical in sorted(variable_map.items(), key=lambda x: -len(x[0])):
-            if original in protected_words:
-                continue
-            text = re.sub(rf"\b{re.escape(original)}\b", canonical, text)
-
-    text = re.sub(r"([=+\-*/<>(),:\[\]{}])", r" \1 ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def shorten_code(text: str, max_lines: int) -> str:
+    lines = (text or "").splitlines()
+    if len(lines) <= max_lines:
+        return "\n".join(lines).strip()
+    kept = "\n".join(lines[:max_lines]).strip()
+    return f"{kept}\n... ({len(lines) - max_lines} more lines)"
 
 
 def find_prompt(data: List[Dict], prompt_id: int) -> Dict:
@@ -261,7 +182,8 @@ def print_cluster(
     items: List[Dict],
     max_text_chars: int,
     max_items: int,
-    show_normalized_reasoning: bool,
+    show_code: bool,
+    max_code_lines: int,
 ) -> None:
     rewards = np.array([item["reward"] for item in items], dtype=float)
     mean_reward = float(np.mean(rewards)) if len(rewards) else float("nan")
@@ -274,12 +196,15 @@ def print_cluster(
             f"  traj_id={traj['traj_id']:>2} reward={traj['reward']} "
             f"prefix={shorten(reasoning, max_text_chars)}"
         )
-        if show_normalized_reasoning:
-            normalized = normalize_reasoning_text(reasoning)
-            print(f"    normalized={shorten(normalized, max_text_chars)}")
         if strategy:
             print(f"    strategy={shorten(strategy, max_text_chars)}")
         print(f"    full={shorten(final_text, max_text_chars)}")
+        if show_code:
+            code_text = extract_last_cpp_block(final_text)
+            if code_text:
+                print("    code:")
+                for line in shorten_code(code_text, max_code_lines).splitlines():
+                    print(f"      {line}")
     remaining = len(items) - max_items
     if remaining > 0:
         print(f"  ... {remaining} more trajectories omitted")
@@ -340,7 +265,8 @@ def main() -> None:
             items,
             args.max_text_chars,
             args.max_items_per_cluster,
-            args.show_normalized_reasoning,
+            args.show_code,
+            args.max_code_lines,
         )
 
 

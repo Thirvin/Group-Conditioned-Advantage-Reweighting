@@ -20,13 +20,15 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 from scipy.sparse.csgraph import connected_components
 
-STRATEGY_SYSTEM_PROMPT = """You convert a mathematical reasoning prefix into a compact strategy representation for clustering.
+STRATEGY_SYSTEM_PROMPT = """You convert a programming-problem reasoning prefix into a compact representation of the model's current thinking logic for clustering.
 
 Requirements:
-- Preserve: operators, equalities, inequalities, causal order, variable relationships, relative magnitude, units, and step sequence.
-- Keep strategy-shift words, but canonicalize them into tags when useful: assume/suppose, let, check/verify, contradiction, case split, bound, substitute, factor, parity, modular arithmetic, symmetry.
+- Focus on the reasoning process already present in the prefix: what the model is trying to establish, what assumptions it is making, what subproblem it is reducing to, what conditions it checks next, and how it chooses the next step.
+- Preserve decision structure, causal order, comparisons, invariants, state transitions, and edge-case considerations when they appear.
+- Preserve code-level relations only when they reflect the reasoning logic, such as loop intent, update rules, indexing logic, or dependency order.
+- Do not rewrite the prefix into a standalone solution template or a generic algorithm label.
 - Output short structured plain text, not JSON.
-- Do not solve the problem further; only summarize the strategy already present in the prefix.
+- Do not solve the problem further; only summarize the thinking logic already present in the prefix.
 """
 
 
@@ -274,7 +276,7 @@ def get_strategy_texts(prefix_texts: List[str], args: argparse.Namespace, client
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.random_seed)
-    embedding_model = SentenceTransformer(args.embedding_model)
+    embedding_model = SentenceTransformer(args.embedding_model, device='cpu')
     strategy_client = build_strategy_client(args)
     strategy_cache = load_strategy_cache(args.strategy_cache_path)
     prefix_tokenizer = None

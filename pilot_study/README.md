@@ -188,7 +188,7 @@ repo 內目前已放了一套偏競程風格的 code evaluation 原型，位於 
   - highest-accuracy case
   - best-homogeneity case
   - best-mid-accuracy case
-- 可檢視原始 reasoning、strategy text、完整輸出。
+- 可檢視原始 reasoning、strategy text、完整輸出，以及分群後對應的程式碼。
 
 ## 各腳本參數與說明
 
@@ -381,10 +381,12 @@ repo 內目前已放了一套偏競程風格的 code evaluation 原型，位於 
   - 輸出時每段文字最多顯示幾個字元，預設 `240`
 - `--max-items-per-cluster`
   - 每個 cluster 最多顯示幾條 trajectory，預設 `10`
+- `--show-code`
+  - 顯示每條 trajectory 最後一個 ` ```cpp``` ` code block
+- `--max-code-lines`
+  - 每條程式碼最多顯示幾行，預設 `40`
 - `--sort-by`
   - 依 `cluster` 或 `reward` 排序
-- `--show-normalized-reasoning`
-  - 顯示 normalize 後的 reasoning
 - `--min-accuracy`
   - `best-mid-accuracy` 模式的下界，預設 `0.2`
 - `--max-accuracy`
