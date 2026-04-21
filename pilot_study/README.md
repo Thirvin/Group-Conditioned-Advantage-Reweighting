@@ -190,6 +190,210 @@ repo 內目前已放了一套偏競程風格的 code evaluation 原型，位於 
   - best-mid-accuracy case
 - 可檢視原始 reasoning、strategy text、完整輸出。
 
+## 各腳本參數與說明
+
+### `01_generate_rollouts.py`
+
+用途：
+- 用本地 `vLLM` 生成程式題 rollout。
+- 生成後再用 `transformers` 抽 prefix hidden state。
+- 對每條 trajectory 用 `code_evals` testcase judge 計算 reward。
+
+主要參數：
+- `--model-name`
+  - 本地生成模型，預設 `Qwen/Qwen2.5-3B-Instruct`
+- `--output-path`
+  - rollout 輸出 pickle，預設 `rollouts_data.pkl`
+- `--dataset-path`
+  - 程式題 CSV 路徑，預設 `code_evals/LCB_dataset.csv`
+- `--question-column`
+  - 題述欄位名稱，預設 `text`
+- `--id-column`
+  - 題目 ID 欄位名稱，預設 `no`
+- `--testcase-root`
+  - testcase 根目錄，預設為 `CODE_EVAL_TESTCASE_ROOT` 或 `/data/leesin5202/version_1/LCB_eval/testcases`
+- `--num-prompts`
+  - 抽多少題，預設 `30`
+- `--num-trajectories`
+  - 每題生成多少條 rollout，預設 `64`
+- `--hidden-batch-size`
+  - hidden-state 抽取 batch size，預設 `8`
+- `--prefix-token-index`
+  - 抽取第幾個 generated token 對應 prefix，預設 `64`
+- `--max-new-tokens`
+  - 每條 rollout 最長生成 token 數，預設 `256`
+- `--temperature`
+  - 生成溫度，預設 `0.8`
+- `--top-p`
+  - nucleus sampling 的 `top-p`，預設 `0.95`
+- `--dtype`
+  - 模型 dtype，可選 `bfloat16` / `float16` / `float32`
+- `--gpu-memory-utilization`
+  - vLLM 使用 GPU 記憶體比例，預設 `0.90`
+- `--max-model-len`
+  - 模型上下文長度上限，預設 `2048`
+- `--tensor-parallel-size`
+  - tensor parallel 數量，預設 `1`
+- `--trust-remote-code`
+  - 是否允許 Hugging Face remote code
+- `--disable-vllm-sleep-mode`
+  - 抽 hidden state 前不要讓 vLLM 進 sleep mode
+- `--smoke-test`
+  - 用 2 題、每題 4 條 trajectory 做快速檢查
+
+### `01_generate_rollouts_api.py`
+
+用途：
+- 用 OpenRouter API 生成程式題 rollout。
+- 不抽 hidden state，但保留 `reasoning_text` / `prefix_text` / `reward`。
+- 支援 checkpoint / resume。
+
+主要參數：
+- `--model-name`
+  - API 模型名稱，預設 `google/gemma-3-27b-it`
+- `--api-key`
+  - OpenRouter API key，預設讀 `OPENROUTER_API_KEY`
+- `--base-url`
+  - OpenRouter base URL，預設 `https://openrouter.ai/api/v1`
+- `--http-referer`
+  - 對應 `OPENROUTER_HTTP_REFERER`
+- `--x-title`
+  - 對應 `OPENROUTER_X_TITLE`
+- `--output-path`
+  - rollout 輸出 pickle，預設 `rollouts_data.pkl`
+- `--dataset-path`
+  - 程式題 CSV 路徑，預設 `code_evals/LCB_dataset.csv`
+- `--question-column`
+  - 題述欄位名稱，預設 `text`
+- `--id-column`
+  - 題目 ID 欄位名稱，預設 `no`
+- `--testcase-root`
+  - testcase 根目錄
+- `--num-prompts`
+  - 抽多少題，預設 `30`
+- `--num-trajectories`
+  - 每題生成多少條 rollout，預設 `64`
+- `--max-output-tokens`
+  - API 最長輸出 token 數，預設 `256`
+- `--temperature`
+  - 生成溫度，預設 `0.8`
+- `--top-p`
+  - nucleus sampling 的 `top-p`，預設 `0.95`
+- `--parallel-requests`
+  - 單題同時送幾個 API requests，預設 `2`
+- `--prefix-token-index`
+  - `prefix_text` 截斷長度，預設 `64`
+- `--max-retries`
+  - API 最多重試次數，預設 `8`
+- `--retry-backoff`
+  - 重試退避秒數倍率，預設 `2.0`
+- `--reasoning-enabled`
+  - 是否請 API 回 reasoning 欄位
+- `--reasoning-effort`
+  - reasoning 強度，可選 `minimal` / `low` / `medium` / `high` / `xhigh` / `none`
+- `--probe-reasoning`
+  - 先用簡單 prompt 測試該模型是否真的回 reasoning
+- `--resume` / `--no-resume`
+  - 是否啟用 checkpoint / resume，預設啟用
+- `--smoke-test`
+  - 小規模快速檢查
+
+### `02_clustering.py`
+
+用途：
+- 對 rollout 的 prefix 表徵做 clustering。
+- 支援 hidden / embedding / kNN graph / matched random baseline。
+- 可選直接用 raw prefix，或先用另一個 LLM 壓縮成 strategy text。
+
+主要參數：
+- `--input-path`
+  - rollout 輸入檔，預設 `rollouts_data.pkl`
+- `--output-path`
+  - clustering 輸出檔，預設 `clustered_data.pkl`
+- `--prefix-token-index`
+  - clustering 前先把 prefix 再截短到多少 token；`None` 表示不再截
+- `--prefix-tokenizer-name`
+  - 做 prefix truncation 時使用的 tokenizer 名稱
+- `--pca-dim`
+  - hidden-state PCA 降維維度，預設 `32`
+- `--distance-quantile`
+  - agglomerative clustering 的自適應距離門檻 quantile，預設 `0.35`
+- `--random-seed`
+  - random baseline 用 seed，預設 `42`
+- `--embedding-model`
+  - sentence-transformer embedding model，預設 `sentence-transformers/all-MiniLM-L6-v2`
+- `--embedding-batch-size`
+  - embedding batch size，預設 `32`
+- `--knn-k`
+  - kNN graph 的鄰居數，預設 `5`
+- `--strategy-source`
+  - `llm` 或 `raw`；`llm` 會先萃取 strategy text，`raw` 直接用 prefix
+- `--strategy-cache-path`
+  - strategy text cache JSON，預設 `strategy_cache.json`
+- `--strategy-model`
+  - strategy extraction 使用的 API 模型，預設 `google/gemma-4-31b`
+- `--strategy-api-key`
+  - 預設讀 `OPENROUTER_API_KEY`
+- `--strategy-base-url`
+  - 預設 `https://openrouter.ai/api/v1`
+- `--strategy-http-referer`
+  - strategy extraction request 的 referer header
+- `--strategy-x-title`
+  - strategy extraction request 的 title header
+- `--strategy-max-output-tokens`
+  - strategy text 最長輸出 token 數，預設 `192`
+- `--strategy-temperature`
+  - strategy extraction 溫度，預設 `0.0`
+- `--strategy-max-retries`
+  - strategy extraction API 最大重試次數，預設 `8`
+- `--strategy-retry-backoff`
+  - strategy extraction retry backoff，預設 `2.0`
+
+### `03_metrics_eval.py`
+
+用途：
+- 對 clustering 結果計算 homogeneity 相關指標。
+
+參數：
+- `--input-path`
+  - clustering 輸入檔，預設 `clustered_data.pkl`
+
+輸出指標：
+- `Var_intra / Var_prompt`
+- `Lucky Guess Rate`
+- `Avg #Clusters (K)`
+- `Singleton Cluster Freq`
+
+### `04_show_clustering.py`
+
+用途：
+- 互動式檢視單一 prompt 的 clustering 結果。
+- 適合快速看某題的 cluster 內容、reward 分布與 reasoning / strategy text。
+
+主要參數：
+- `--input-path`
+  - clustering 輸入檔，預設 `clustered_data.pkl`
+- `--prompt-id`
+  - 指定要看哪一題；若不給，可搭配 `--select`
+- `--method`
+  - 要看哪種 clustering 結果，可選 `hidden` / `embedding` / `knn` / `random`
+- `--max-text-chars`
+  - 輸出時每段文字最多顯示幾個字元，預設 `240`
+- `--max-items-per-cluster`
+  - 每個 cluster 最多顯示幾條 trajectory，預設 `10`
+- `--sort-by`
+  - 依 `cluster` 或 `reward` 排序
+- `--show-normalized-reasoning`
+  - 顯示 normalize 後的 reasoning
+- `--min-accuracy`
+  - `best-mid-accuracy` 模式的下界，預設 `0.2`
+- `--max-accuracy`
+  - `best-mid-accuracy` 模式的上界，預設 `0.8`
+- `--include-degenerate`
+  - 是否包含 reward 沒有變異的題目
+- `--select`
+  - 題目挑選方式，可選 `manual` / `highest-accuracy` / `best-homogeneity` / `best-mid-accuracy`
+
 ## 下一步方向
 
 接下來建議把資料集與 reward 定義正式切到程式問題，例如：
